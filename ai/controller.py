@@ -1,251 +1,199 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Protocol
+from typing import Any, Dict, Optional
 
 from actions.models import ActionProposal
-from ai.fsm import TacticalFSM, TacticalState
-from ai.reactive import ReactiveDecision, ReactiveEngine
-from ai.utility import UtilityDecision, UtilityScorer
-from state.models import DynamicRoundState, MatchContext
+from state.models import DynamicRoundState
 from state.trackers import TrackerBundle
 
+from .fsm import TacticalMode, TacticalStateMachine
+from .modes import ModeRegistry
+from .reactive import ReactiveDecision, ReactiveEngine
+from .utility import ModeScore, UtilityEngine
+
 
 @dataclass(slots=True)
-class AIContext:
+class TickDecisionContext:
     """
-    Полный контекст одного тика, который нужен AI-слою.
+    Полный AI-контекст на один тик.
 
-    Это единая точка передачи данных между:
-    - reactive layer
-    - utility scoring
-    - FSM
-    - modes
+    Это основной объект, который передается в reactive / utility / mode handlers.
+    Он собирает все уже подготовленные данные в одну структуру, чтобы:
+    - не тащить 10 аргументов в каждый вызов;
+    - упростить тестирование;
+    - стандартизировать decision pipeline.
     """
 
-    tick_index: int
-    match_context: MatchContext
-    round_state: DynamicRoundState
+    tick: int
+    world: DynamicRoundState
     trackers: TrackerBundle
     features: Dict[str, Any]
-    settings: Any
-
-    @property
-    def self_state(self) -> Any:
-        return self.round_state.self_state
-
-    @property
-    def enemy_state(self) -> Any:
-        return self.round_state.enemy_state
-
-    @property
-    def round_index(self) -> int:
-        return self.round_state.round_index
-
-    @property
-    def map_id(self) -> str:
-        return self.round_state.map_id
+    score_series_ours: int
+    score_series_enemy: int
+    round_index: int
+    map_id: str
+    debug_enabled: bool = False
 
 
 @dataclass(slots=True)
-class AIDecision:
+class TickDecisionResult:
     """
-    Результат работы AI-слоя за один тик.
+    Результат работы AI-контроллера на текущем тике.
 
-    Важно: это еще не финальная сериализуемая игровая команда.
-    Это внутреннее AI-решение, которое затем пройдет через action layer.
+    На этом этапе это еще НЕ финальная сериализованная команда протокола,
+    а внутренняя AI-структура, которую дальше сможет обработать actions-layer.
     """
 
-    tick_index: int
-    selected_mode: str
-    tactical_state: TacticalState
-    action_proposal: ActionProposal
-
-    source: str  # reactive | tactical | fallback
+    selected_mode: TacticalMode
+    proposal: ActionProposal
+    used_reactive_override: bool
     reactive_reason: Optional[str] = None
-
-    utility_scores: Dict[str, float] = field(default_factory=dict)
-    strategic_tags: Dict[str, Any] = field(default_factory=dict)
-    debug: Dict[str, Any] = field(default_factory=dict)
-
-
-class ModeHandler(Protocol):
-    """
-    Контракт для обработчика режима поведения.
-
-    Каждый режим в modes.py должен уметь:
-    - иметь уникальное имя;
-    - по AIContext возвращать ActionProposal.
-    """
-
-    mode_name: str
-
-    def build_action(self, ctx: AIContext, tactical_state: TacticalState) -> ActionProposal:
-        ...
+    utility_scores: Dict[TacticalMode, ModeScore] = field(default_factory=dict)
+    decision_notes: Dict[str, Any] = field(default_factory=dict)
 
 
 class AIController:
     """
-    Центральный оркестратор AI-слоя.
+    Центральный координатор AI-пайплайна.
 
-    Порядок работы:
-    1. Reactive scan
-    2. Utility evaluation
-    3. FSM update
-    4. Mode action build
-    5. Возврат AIDecision
+    Обязанности:
+    1. Сформировать decision context.
+    2. Проверить reactive overrides.
+    3. Если override не найден — запросить utility scoring.
+    4. Передать scoring в FSM для выбора устойчивого режима.
+    5. Получить action proposal от handler'а выбранного режима.
+    6. Вернуть структурированный результат для следующего слоя.
 
-    Этот класс специально не содержит деталей конкретной тактики.
-    Его задача — собирать решение из специализированных подсистем.
+    Важно:
+    - Controller НЕ реализует детальную тактическую логику режимов.
+    - Controller НЕ валидирует финальную команду протокола.
+    - Controller НЕ сериализует ответ в JSON.
     """
 
     def __init__(
         self,
         reactive_engine: ReactiveEngine,
-        utility_scorer: UtilityScorer,
-        tactical_fsm: TacticalFSM,
-        mode_handlers: Dict[str, ModeHandler],
+        utility_engine: UtilityEngine,
+        tactical_fsm: TacticalStateMachine,
+        mode_registry: ModeRegistry,
+        *,
+        debug_enabled: bool = False,
     ) -> None:
         self._reactive_engine = reactive_engine
-        self._utility_scorer = utility_scorer
+        self._utility_engine = utility_engine
         self._tactical_fsm = tactical_fsm
-        self._mode_handlers = dict(mode_handlers)
+        self._mode_registry = mode_registry
+        self._debug_enabled = debug_enabled
 
-    def decide(self, ctx: AIContext) -> AIDecision:
+    def build_context(
+        self,
+        *,
+        world: DynamicRoundState,
+        trackers: TrackerBundle,
+        features: Dict[str, Any],
+    ) -> TickDecisionContext:
         """
-        Главная точка входа AI-слоя на одном тике.
+        Собирает единый decision context на текущий тик.
+
+        Предполагается, что к этому моменту:
+        - world уже обновлен;
+        - trackers уже обновлены;
+        - feature pipeline уже выполнен.
         """
+        return TickDecisionContext(
+            tick=world.tick,
+            world=world,
+            trackers=trackers,
+            features=features,
+            score_series_ours=world.series_score.self_score,
+            score_series_enemy=world.series_score.enemy_score,
+            round_index=world.round_index,
+            map_id=world.map_id,
+            debug_enabled=self._debug_enabled,
+        )
 
-        # ------------------------------------------------------------------
-        # P0. Базовая валидация жизнеспособности контекста
-        # ------------------------------------------------------------------
-        if not self._is_context_actionable(ctx):
-            fallback = self._build_safe_idle_fallback(ctx, reason="invalid_or_dead_context")
-            return AIDecision(
-                tick_index=ctx.tick_index,
-                selected_mode="fallback_idle",
-                tactical_state=self._tactical_fsm.current_state,
-                action_proposal=fallback,
-                source="fallback",
-                reactive_reason="invalid_or_dead_context",
-                debug={"stage": "p0_validation"},
-            )
+    def decide(
+        self,
+        *,
+        world: DynamicRoundState,
+        trackers: TrackerBundle,
+        features: Dict[str, Any],
+    ) -> TickDecisionResult:
+        """
+        Главный entrypoint AI-решения на тик.
 
-        # ------------------------------------------------------------------
-        # P1-P2. Reactive override
-        # ------------------------------------------------------------------
+        Последовательность:
+        1. build_context
+        2. reactive scan
+        3. utility scoring (если override нет)
+        4. FSM mode selection
+        5. mode proposal generation
+        """
+        ctx = self.build_context(world=world, trackers=trackers, features=features)
+
         reactive_decision = self._reactive_engine.evaluate(ctx)
-        if reactive_decision.triggered:
+        if reactive_decision.should_override:
             return self._build_reactive_result(ctx, reactive_decision)
 
-        # ------------------------------------------------------------------
-        # P3-P6. Tactical / utility path
-        # ------------------------------------------------------------------
-        utility_decision = self._utility_scorer.evaluate(ctx, self._tactical_fsm.current_state)
+        utility_scores = self._utility_engine.score_modes(ctx)
+        selected_mode = self._tactical_fsm.select_mode(ctx, utility_scores)
 
-        transition_result = self._tactical_fsm.update(
-            ctx=ctx,
-            desired_mode=utility_decision.selected_mode,
-            utility_decision=utility_decision,
-        )
+        proposal = self._resolve_mode_proposal(ctx, selected_mode)
 
-        active_mode = transition_result.active_mode
-        proposal = self._build_mode_action(ctx, active_mode, transition_result.new_state)
-
-        return AIDecision(
-            tick_index=ctx.tick_index,
-            selected_mode=active_mode,
-            tactical_state=transition_result.new_state,
-            action_proposal=proposal,
-            source="tactical",
-            utility_scores={name: score.score for name, score in utility_decision.mode_scores.items()},
-            strategic_tags=dict(utility_decision.tags),
-            debug={
-                "stage": "tactical",
-                "desired_mode": utility_decision.selected_mode,
-                "fsm_transition": transition_result.transition_kind,
-                "fsm_reason": transition_result.reason,
+        return TickDecisionResult(
+            selected_mode=selected_mode,
+            proposal=proposal,
+            used_reactive_override=False,
+            reactive_reason=None,
+            utility_scores=utility_scores,
+            decision_notes={
+                "fsm_previous_mode": self._tactical_fsm.previous_mode_name(),
+                "fsm_selected_mode": selected_mode.value,
             },
         )
 
-    def _build_reactive_result(self, ctx: AIContext, decision: ReactiveDecision) -> AIDecision:
-        """
-        Упаковка reactive override в стандартный AIDecision.
-        """
-        tactical_state = self._tactical_fsm.current_state
-
-        return AIDecision(
-            tick_index=ctx.tick_index,
-            selected_mode=decision.override_mode,
-            tactical_state=tactical_state,
-            action_proposal=decision.action_proposal,
-            source="reactive",
-            reactive_reason=decision.reason.value,
-            debug={
-                "stage": "reactive",
-                "priority": decision.priority,
-                "details": dict(decision.details),
-            },
-        )
-
-    def _build_mode_action(
+    def _build_reactive_result(
         self,
-        ctx: AIContext,
-        mode_name: str,
-        tactical_state: TacticalState,
+        ctx: TickDecisionContext,
+        reactive_decision: ReactiveDecision,
+    ) -> TickDecisionResult:
+        """
+        Упаковывает reactive override в единый TickDecisionResult.
+        """
+        selected_mode = reactive_decision.forced_mode or TacticalMode.REACTIVE_OVERRIDE
+
+        return TickDecisionResult(
+            selected_mode=selected_mode,
+            proposal=reactive_decision.proposal,
+            used_reactive_override=True,
+            reactive_reason=reactive_decision.reason,
+            utility_scores={},
+            decision_notes={
+                "reactive_priority": reactive_decision.priority,
+                "reactive_tags": list(reactive_decision.tags),
+                "reactive_mode": selected_mode.value,
+            },
+        )
+
+    def _resolve_mode_proposal(
+        self,
+        ctx: TickDecisionContext,
+        mode: TacticalMode,
     ) -> ActionProposal:
         """
-        Построение action proposal через обработчик режима.
+        Получает proposal от handler'а выбранного режима.
+
+        Если handler не зарегистрирован, используем safe fallback mode.
         """
-        handler = self._mode_handlers.get(mode_name)
+        handler = self._mode_registry.get(mode)
+
         if handler is None:
-            return self._build_safe_idle_fallback(ctx, reason=f"missing_mode_handler:{mode_name}")
+            fallback_handler = self._mode_registry.get(TacticalMode.SAFE_FALLBACK)
+            if fallback_handler is None:
+                raise RuntimeError(
+                    "ModeRegistry has no handler for selected mode and no SAFE_FALLBACK handler."
+                )
+            return fallback_handler.propose(ctx)
 
-        proposal = handler.build_action(ctx, tactical_state)
-
-        if proposal is None:
-            return self._build_safe_idle_fallback(ctx, reason=f"mode_returned_none:{mode_name}")
-
-        return proposal
-
-    def _is_context_actionable(self, ctx: AIContext) -> bool:
-        """
-        Минимальная sanity-проверка перед запуском AI.
-
-        Здесь без фанатизма:
-        - self_state должен быть доступен
-        - enemy_state должен быть доступен
-        - бот должен быть жив
-        """
-        self_state = getattr(ctx.round_state, "self_state", None)
-        enemy_state = getattr(ctx.round_state, "enemy_state", None)
-
-        if self_state is None or enemy_state is None:
-            return False
-
-        is_alive = getattr(self_state, "is_alive", True)
-        return bool(is_alive)
-
-    def _build_safe_idle_fallback(self, ctx: AIContext, reason: str) -> ActionProposal:
-        """
-        Временный безопасный fallback на уровне AI.
-
-        Важно:
-        это НЕ финальный safety controller из отдельного слоя actions/safety,
-        а локальная страховка, чтобы AI никогда не падал в пустоту.
-        """
-        return ActionProposal(
-            move=(0.0, 0.0),
-            aim=None,
-            shoot=False,
-            kick=False,
-            pickup=False,
-            drop=False,
-            throw=False,
-            interact=False,
-            meta={
-                "source": "ai_fallback",
-                "reason": reason,
-                "tick": ctx.tick_index,
-            },
-        )
+        return handler.propose(ctx)
